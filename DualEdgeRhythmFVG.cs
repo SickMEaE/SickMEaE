@@ -1,5 +1,5 @@
 // ===========================================================================
-// Dual Edge Rhythm+FVG -- Tue/Wed/Thu session variant  [v2 - MTF + Re-Entry]
+// Dual Edge Rhythm+FVG -- Tue/Wed/Thu session variant  [v3 - Risk Overhaul]
 //
 // Strategy: Trend-pullback entries into Fair Value Gaps during a session
 // window. Filters stacked across THREE timeframes:
@@ -10,7 +10,7 @@
 // Instrument:    XAGUSD / Silver
 // Compatibility: cAlgo / cTrader
 //
-// FIXES INCLUDED:
+// v2 FIXES:
 //   1) Uses completed bars in OnBar logic instead of forming bar Last(0).
 //   2) Session helper supports overnight sessions, e.g. 22 -> 2.
 //   3) HTF/LTF filters wait for EMA warm-up instead of using too little data.
@@ -19,9 +19,33 @@
 //   6) Optional warning if bot is attached to a non-XAG symbol.
 //   7) Hard cutoff hour (default 05:00 UTC): flattens ALL bot positions and
 //      blocks new entries during that hour, regardless of other settings.
+//
+// v3 RISK OVERHAUL:
+//   8)  Percent-of-equity position sizing (constant $ risk per trade despite
+//       the ATR-based variable stop). Fixed lots remain as a fallback mode.
+//   9)  All protective exits (hard cutoff, session end, max hold, soft loss,
+//       daily loss, kill switch, breakeven/trailing) run on EVERY TICK, not
+//       just on bar open.
+//   10) Stop loss is verified after each fill; a naked position is closed
+//       immediately.
+//   11) Daily trade count and daily PnL are rebuilt from History on restart,
+//       so a bot restart cannot double the per-day allowances.
+//   12) Swings/FVGs keep updating while a position is open (no stale state).
+//   13) Daily loss limit is label-scoped (this bot's trades only), not
+//       whole-account equity.
+//   14) Daily news blackout window (default 12:25-12:40 UTC covers 8:30 ET
+//       US releases) + max-spread-vs-SL entry guard.
+//   15) Breakeven move at +1R (small offset) and optional ATR trailing stop.
+//       Initial risk is stored in the position comment so it survives
+//       restarts.
+//   16) ATR-relative FVG minimum size and EMA pullback tolerance (legacy
+//       absolute/percent thresholds available via toggle).
+//   17) Account-level kill switch: max total drawdown from starting equity
+//       flattens the bot's positions and halts all trading.
 // ===========================================================================
 
 using System;
+using System.Globalization;
 using cAlgo.API;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
@@ -32,6 +56,7 @@ namespace cAlgo.Robots
     public class DualEdgeRhythmFVG : Robot
     {
         private const int ClosedBarOffset = 1;
+        private const string RiskCommentPrefix = "R=";
 
         // --- SESSION FILTER ---
         [Parameter("Session Start Hour (UTC)", Group = "Session Filter", DefaultValue = 12, MinValue = 0, MaxValue = 23)]
@@ -51,6 +76,19 @@ namespace cAlgo.Robots
 
         [Parameter("Close Open Positions at Session End", Group = "Session Filter", DefaultValue = true)]
         public bool CloseAtSessionEnd { get; set; }
+
+        // --- NEWS FILTER ---
+        [Parameter("Enable News Blackout", Group = "News Filter", DefaultValue = true)]
+        public bool UseNewsBlackout { get; set; }
+
+        [Parameter("Blackout Start Hour (UTC)", Group = "News Filter", DefaultValue = 12, MinValue = 0, MaxValue = 23)]
+        public int NewsBlackoutHour { get; set; }
+
+        [Parameter("Blackout Start Minute", Group = "News Filter", DefaultValue = 25, MinValue = 0, MaxValue = 59)]
+        public int NewsBlackoutMinute { get; set; }
+
+        [Parameter("Blackout Duration (minutes)", Group = "News Filter", DefaultValue = 15, MinValue = 1, MaxValue = 180)]
+        public int NewsBlackoutDuration { get; set; }
 
         // --- DAY-OF-WEEK FILTER ---
         [Parameter("Enable Day Filter", Group = "Day Filter", DefaultValue = true)]
@@ -81,6 +119,9 @@ namespace cAlgo.Robots
         [Parameter("Swing High/Low Lookback", Group = "Trend Detection", DefaultValue = 10, MinValue = 3, MaxValue = 30)]
         public int StructureLen { get; set; }
 
+        [Parameter("Pullback Tolerance (ATR mult)", Group = "Trend Detection", DefaultValue = 0.3, MinValue = 0.05, MaxValue = 2.0, Step = 0.05)]
+        public double PullbackAtrTolerance { get; set; }
+
         // --- MULTI-TIMEFRAME ---
         [Parameter("Use HTF Bias Filter", Group = "Multi-Timeframe", DefaultValue = true)]
         public bool UseHtfBias { get; set; }
@@ -110,15 +151,33 @@ namespace cAlgo.Robots
         public bool DiagnosticMode { get; set; }
 
         // --- FVG SETTINGS ---
-        [Parameter("Minimum FVG Size", Group = "FVG Settings", DefaultValue = 0.01, Step = 0.005)]
+        [Parameter("Use ATR-Relative Thresholds", Group = "FVG Settings", DefaultValue = true)]
+        public bool UseAtrRelative { get; set; }
+
+        [Parameter("FVG Min Size (ATR mult)", Group = "FVG Settings", DefaultValue = 0.05, MinValue = 0.01, MaxValue = 2.0, Step = 0.01)]
+        public double FvgMinSizeAtr { get; set; }
+
+        [Parameter("Minimum FVG Size (legacy, price)", Group = "FVG Settings", DefaultValue = 0.01, Step = 0.005)]
         public double FvgMinSize { get; set; }
 
         [Parameter("Max FVG Age (bars)", Group = "FVG Settings", DefaultValue = 20, MinValue = 5, MaxValue = 50)]
         public int FvgMaxAge { get; set; }
 
         // --- RISK MANAGEMENT ---
-        [Parameter("Lot Size", Group = "Risk Management", DefaultValue = 0.06, MinValue = 0.01, Step = 0.01)]
+        [Parameter("Use % Risk Sizing", Group = "Risk Management", DefaultValue = true)]
+        public bool UsePercentRisk { get; set; }
+
+        [Parameter("Risk % of Equity per Trade", Group = "Risk Management", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 5.0, Step = 0.1)]
+        public double RiskPercent { get; set; }
+
+        [Parameter("Max Lots Cap", Group = "Risk Management", DefaultValue = 0.5, MinValue = 0.01, Step = 0.01)]
+        public double MaxLots { get; set; }
+
+        [Parameter("Lot Size (if % sizing off)", Group = "Risk Management", DefaultValue = 0.06, MinValue = 0.01, Step = 0.01)]
         public double Lots { get; set; }
+
+        [Parameter("Max Spread (% of SL, 0=off)", Group = "Risk Management", DefaultValue = 10.0, MinValue = 0.0, MaxValue = 50.0, Step = 1.0)]
+        public double MaxSpreadPctOfSl { get; set; }
 
         [Parameter("Risk:Reward Ratio", Group = "Risk Management", DefaultValue = 2.0, MinValue = 1.0, MaxValue = 5.0, Step = 0.5)]
         public double RiskReward { get; set; }
@@ -132,11 +191,33 @@ namespace cAlgo.Robots
         [Parameter("Max Daily Loss %", Group = "Risk Management", DefaultValue = 3.0, MinValue = 1.0, MaxValue = 10.0, Step = 0.5)]
         public double MaxDailyLoss { get; set; }
 
+        [Parameter("Max Total Drawdown % (0=off)", Group = "Risk Management", DefaultValue = 10.0, MinValue = 0.0, MaxValue = 50.0, Step = 1.0)]
+        public double MaxTotalDrawdown { get; set; }
+
         [Parameter("Max Trades Per Day", Group = "Risk Management", DefaultValue = 2, MinValue = 1, MaxValue = 5)]
         public int MaxTradesPerDay { get; set; }
 
         [Parameter("Order Label", Group = "Risk Management", DefaultValue = "DualEdge_TueThu")]
         public string Label { get; set; }
+
+        // --- TRADE MANAGEMENT ---
+        [Parameter("Enable Breakeven", Group = "Trade Management", DefaultValue = true)]
+        public bool UseBreakeven { get; set; }
+
+        [Parameter("Breakeven Trigger (R)", Group = "Trade Management", DefaultValue = 1.0, MinValue = 0.2, MaxValue = 3.0, Step = 0.1)]
+        public double BreakevenTriggerR { get; set; }
+
+        [Parameter("Breakeven Offset (pips)", Group = "Trade Management", DefaultValue = 1.0, MinValue = 0.0, Step = 0.5)]
+        public double BreakevenOffsetPips { get; set; }
+
+        [Parameter("Enable ATR Trailing Stop", Group = "Trade Management", DefaultValue = false)]
+        public bool UseAtrTrail { get; set; }
+
+        [Parameter("Trail Start (R)", Group = "Trade Management", DefaultValue = 1.0, MinValue = 0.2, MaxValue = 5.0, Step = 0.1)]
+        public double TrailStartR { get; set; }
+
+        [Parameter("Trail ATR Multiplier", Group = "Trade Management", DefaultValue = 1.0, MinValue = 0.3, MaxValue = 3.0, Step = 0.1)]
+        public double TrailAtrMultiplier { get; set; }
 
         // --- LOSS MANAGEMENT ---
         [Parameter("Enable Max Hold Time Exit", Group = "Loss Management", DefaultValue = true)]
@@ -188,8 +269,13 @@ namespace cAlgo.Robots
 
         private int _tradesToday = 0;
         private double _dailyStartEquity = 0;
+        private double _realizedToday = 0;
+        private double _floatingAtDayStart = 0;
         private bool _dailyLossHit = false;
         private DateTime _currentDay = DateTime.MinValue;
+
+        private double _startingEquity = 0;
+        private bool _killSwitchHit = false;
 
         private TradeType? _lastClosedDirection = null;
         private int _lastClosedBarIndex = -1;
@@ -216,23 +302,36 @@ namespace cAlgo.Robots
             _htfEma = Indicators.ExponentialMovingAverage(_htfBars.ClosePrices, HtfEmaLength);
             _ltfEma = Indicators.ExponentialMovingAverage(_ltfBars.ClosePrices, LtfEmaLength);
 
-            _dailyStartEquity = Account.Equity;
+            _startingEquity = Account.Equity;
             _currentDay = Server.Time.Date;
+
+            RestoreDailyStateFromHistory();
 
             Positions.Closed += OnPositionClosed;
 
             if (DiagnosticMode && SymbolName.IndexOf("XAG", StringComparison.OrdinalIgnoreCase) < 0)
                 Print("WARNING: This bot was designed for XAGUSD/Silver but is attached to {0}.", SymbolName);
 
-            Print("Dual Edge v2 started. Session {0}:00-{1}:00 UTC | Lots {2} | RR {3} | MaxDailyLoss {4}% | MaxHold {5}h losersOnly={6}",
-                  SessionStartHour, SessionEndHour, Lots, RiskReward, MaxDailyLoss, MaxHoldHours, OnlyCloseLosers);
+            Print("Dual Edge v3 started. Session {0}:00-{1}:00 UTC | RR {2} | MaxDailyLoss {3}% | MaxHold {4}h losersOnly={5}",
+                  SessionStartHour, SessionEndHour, RiskReward, MaxDailyLoss, MaxHoldHours, OnlyCloseLosers);
 
             Print("MTF: HTF={0} EMA{1} structAgree={2} | LTF={3} EMA{4} | ReEntryBlock={5} cd={6}bars afterLossOnly={7}",
                   HtfTimeFrame, HtfEmaLength, HtfRequireStructure, LtfTimeFrame, LtfEmaLength,
                   BlockSameDirection, SameDirCooldownBars, OnlyBlockAfterLoss);
 
+            Print("RISK: sizing={0} | spreadGuard {1}% of SL | killSwitch {2}% | BE {3} @ {4}R +{5}pips | trail {6} {7}xATR from {8}R | atrRelative={9}",
+                  UsePercentRisk ? RiskPercent + "% equity (cap " + MaxLots + " lots)" : "fixed " + Lots + " lots",
+                  MaxSpreadPctOfSl, MaxTotalDrawdown,
+                  UseBreakeven, BreakevenTriggerR, BreakevenOffsetPips,
+                  UseAtrTrail, TrailAtrMultiplier, TrailStartR, UseAtrRelative);
+
             if (UseHardCutoff)
                 Print("HARD CUTOFF enabled: all positions flattened at {0:00}:00 UTC and no entries during that hour.", HardCutoffHour);
+
+            if (UseNewsBlackout)
+                Print("NEWS BLACKOUT enabled: no entries {0:00}:{1:00}-{2} UTC daily.",
+                      NewsBlackoutHour, NewsBlackoutMinute,
+                      TimeSpan.FromMinutes(NewsBlackoutHour * 60 + NewsBlackoutMinute + NewsBlackoutDuration).ToString(@"hh\:mm"));
         }
 
         protected override void OnStop()
@@ -250,6 +349,49 @@ namespace cAlgo.Robots
                 Print("ZERO setups reached the MTF gates. Check session/day/month filters, structure, pullback, and FVG rules.");
         }
 
+        // Rebuilds today's trade count and realized PnL from trade history so a
+        // bot restart cannot reset the per-day limits.
+        private void RestoreDailyStateFromHistory()
+        {
+            DateTime today = Server.Time.Date;
+            double realizedToday = 0;
+            int entriesToday = 0;
+
+            foreach (HistoricalTrade trade in History)
+            {
+                if (trade.Label != Label || trade.SymbolName != SymbolName)
+                    continue;
+
+                if (trade.EntryTime.Date == today)
+                    entriesToday++;
+
+                if (trade.ClosingTime.Date == today)
+                    realizedToday += trade.NetProfit;
+            }
+
+            double floating = 0;
+
+            foreach (var position in Positions.FindAll(Label, SymbolName))
+            {
+                if (position.EntryTime.Date == today)
+                    entriesToday++;
+
+                floating += position.NetProfit;
+            }
+
+            _tradesToday = entriesToday;
+            _realizedToday = realizedToday;
+            _floatingAtDayStart = 0;
+
+            // Approximate the equity this bot's account had at the start of the
+            // day by backing out today's bot PnL from current equity.
+            _dailyStartEquity = Account.Equity - realizedToday - floating;
+
+            if (entriesToday > 0)
+                Print("RESTORED daily state from history: {0} trade(s) today, realized {1:F2}, baseline equity {2:F2}.",
+                      entriesToday, realizedToday, _dailyStartEquity);
+        }
+
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
             var p = args.Position;
@@ -259,24 +401,36 @@ namespace cAlgo.Robots
             _lastClosedDirection = p.TradeType;
             _lastClosedBarIndex = Bars.Count - 1;
             _lastCloseWasLoss = p.NetProfit < 0;
+            _realizedToday += p.NetProfit;
+        }
+
+        // Protective logic runs on every tick so exits do not wait for the next
+        // bar open (important on H1/H4 charts).
+        protected override void OnTick()
+        {
+            ResetDailyIfNewDay();
+            UpdateDailyLossStatus();
+            CheckKillSwitch();
+            HandleHardCutoff();
+            HandleSessionEnd();
+            HandleMaxHoldTime();
+            ManageOpenPositions();
         }
 
         protected override void OnBar()
         {
             ResetDailyIfNewDay();
-            UpdateDailyLossStatus();
-            HandleHardCutoff();
-            HandleSessionEnd();
-            HandleMaxHoldTime();
-
-            if (HasOpenPosition())
-                return;
 
             if (!ChartDataReady())
                 return;
 
+            // Swings/FVGs are tracked even while a position is open so the
+            // structure state is never stale when the next entry is evaluated.
             UpdateSwings();
             UpdateFvgs();
+
+            if (HasOpenPosition())
+                return;
 
             if (!AllFiltersPass())
                 return;
@@ -301,25 +455,58 @@ namespace cAlgo.Robots
             {
                 _currentDay = today;
                 _tradesToday = 0;
+                _realizedToday = 0;
                 _dailyStartEquity = Account.Equity;
+                _floatingAtDayStart = SumLabelFloatingPnl();
                 _dailyLossHit = false;
             }
         }
 
+        private double SumLabelFloatingPnl()
+        {
+            double total = 0;
+
+            foreach (var position in Positions.FindAll(Label, SymbolName))
+                total += position.NetProfit;
+
+            return total;
+        }
+
+        // Daily loss is measured from THIS bot's trades only (realized today +
+        // change in floating PnL), so other activity on the account does not
+        // contaminate the limit.
         private void UpdateDailyLossStatus()
         {
             if (_dailyStartEquity <= 0)
                 return;
 
-            double dailyLossPct = (_dailyStartEquity - Account.Equity) / _dailyStartEquity * 100.0;
+            double dailyPnl = _realizedToday + SumLabelFloatingPnl() - _floatingAtDayStart;
+            double dailyLossPct = -dailyPnl / _dailyStartEquity * 100.0;
 
             if (dailyLossPct >= MaxDailyLoss)
             {
                 if (!_dailyLossHit)
-                    Print("DAILY LOSS LIMIT HIT: {0:F2}% - no new trades today.", dailyLossPct);
+                    Print("DAILY LOSS LIMIT HIT: {0:F2}% (bot PnL {1:F2}) - no new trades today.", dailyLossPct, dailyPnl);
 
                 _dailyLossHit = true;
             }
+        }
+
+        private void CheckKillSwitch()
+        {
+            if (MaxTotalDrawdown <= 0 || _killSwitchHit || _startingEquity <= 0)
+                return;
+
+            double drawdownPct = (_startingEquity - Account.Equity) / _startingEquity * 100.0;
+
+            if (drawdownPct < MaxTotalDrawdown)
+                return;
+
+            _killSwitchHit = true;
+            Print("KILL SWITCH: total drawdown {0:F2}% >= {1}% - flattening and halting all trading.", drawdownPct, MaxTotalDrawdown);
+
+            foreach (var position in Positions.FindAll(Label, SymbolName))
+                ClosePosition(position);
         }
 
         private bool IsInSession()
@@ -338,6 +525,21 @@ namespace cAlgo.Robots
         private bool IsInHardCutoffHour()
         {
             return UseHardCutoff && Server.Time.Hour == HardCutoffHour;
+        }
+
+        private bool IsInNewsBlackout()
+        {
+            if (!UseNewsBlackout)
+                return false;
+
+            int nowMinutes = Server.Time.Hour * 60 + Server.Time.Minute;
+            int start = NewsBlackoutHour * 60 + NewsBlackoutMinute;
+            int end = (start + NewsBlackoutDuration) % 1440;
+
+            if (start < end)
+                return nowMinutes >= start && nowMinutes < end;
+
+            return nowMinutes >= start || nowMinutes < end;
         }
 
         private void HandleHardCutoff()
@@ -404,6 +606,95 @@ namespace cAlgo.Robots
                     Print("SOFT-LOSS cut after {0:F1}h. ID {1} Net {2:F2}", hoursOpen, position.Id, position.NetProfit);
                 }
             }
+        }
+
+        // Breakeven + optional ATR trailing. The initial risk distance is read
+        // back from the position comment ("R=<sl pips>") so it survives
+        // restarts and SL modifications.
+        private void ManageOpenPositions()
+        {
+            if (!UseBreakeven && !UseAtrTrail)
+                return;
+
+            double atrValue = _atr.Result.Count > AtrLength ? _atr.Result.Last(ClosedBarOffset) : double.NaN;
+
+            foreach (var position in Positions.FindAll(Label, SymbolName))
+            {
+                double riskDistance = GetInitialRiskDistance(position);
+
+                if (riskDistance <= 0)
+                    continue;
+
+                double entry = position.EntryPrice;
+
+                if (position.TradeType == TradeType.Buy)
+                {
+                    double profitDistance = Symbol.Bid - entry;
+
+                    if (UseBreakeven && profitDistance >= riskDistance * BreakevenTriggerR)
+                    {
+                        double bePrice = entry + BreakevenOffsetPips * Symbol.PipSize;
+
+                        if ((!position.StopLoss.HasValue || position.StopLoss.Value < bePrice - Symbol.TickSize) &&
+                            bePrice < Symbol.Bid)
+                        {
+                            position.ModifyStopLossPrice(bePrice);
+                            Print("BREAKEVEN set at {0} (+{1}R reached). ID {2}", bePrice, BreakevenTriggerR, position.Id);
+                        }
+                    }
+
+                    if (UseAtrTrail && !double.IsNaN(atrValue) && atrValue > 0 &&
+                        profitDistance >= riskDistance * TrailStartR)
+                    {
+                        double trailSl = Symbol.Bid - atrValue * TrailAtrMultiplier;
+
+                        if ((!position.StopLoss.HasValue || trailSl > position.StopLoss.Value + Symbol.TickSize) &&
+                            trailSl < Symbol.Bid)
+                            position.ModifyStopLossPrice(trailSl);
+                    }
+                }
+                else
+                {
+                    double profitDistance = entry - Symbol.Ask;
+
+                    if (UseBreakeven && profitDistance >= riskDistance * BreakevenTriggerR)
+                    {
+                        double bePrice = entry - BreakevenOffsetPips * Symbol.PipSize;
+
+                        if ((!position.StopLoss.HasValue || position.StopLoss.Value > bePrice + Symbol.TickSize) &&
+                            bePrice > Symbol.Ask)
+                        {
+                            position.ModifyStopLossPrice(bePrice);
+                            Print("BREAKEVEN set at {0} (+{1}R reached). ID {2}", bePrice, BreakevenTriggerR, position.Id);
+                        }
+                    }
+
+                    if (UseAtrTrail && !double.IsNaN(atrValue) && atrValue > 0 &&
+                        profitDistance >= riskDistance * TrailStartR)
+                    {
+                        double trailSl = Symbol.Ask + atrValue * TrailAtrMultiplier;
+
+                        if ((!position.StopLoss.HasValue || trailSl < position.StopLoss.Value - Symbol.TickSize) &&
+                            trailSl > Symbol.Ask)
+                            position.ModifyStopLossPrice(trailSl);
+                    }
+                }
+            }
+        }
+
+        private double GetInitialRiskDistance(Position position)
+        {
+            string comment = position.Comment;
+
+            if (string.IsNullOrEmpty(comment) || !comment.StartsWith(RiskCommentPrefix, StringComparison.Ordinal))
+                return 0;
+
+            double slPips;
+
+            if (!double.TryParse(comment.Substring(RiskCommentPrefix.Length), NumberStyles.Float, CultureInfo.InvariantCulture, out slPips))
+                return 0;
+
+            return slPips * Symbol.PipSize;
         }
 
         private bool HasOpenPosition()
@@ -598,6 +889,19 @@ namespace cAlgo.Robots
             return pivotValue;
         }
 
+        private double EffectiveFvgMinSize()
+        {
+            if (UseAtrRelative)
+            {
+                double atrValue = _atr.Result.Last(ClosedBarOffset);
+
+                if (!double.IsNaN(atrValue) && atrValue > 0)
+                    return atrValue * FvgMinSizeAtr;
+            }
+
+            return FvgMinSize;
+        }
+
         private void UpdateFvgs()
         {
             if (Bars.Count < 4)
@@ -623,10 +927,12 @@ namespace cAlgo.Robots
                     ClearBearFvg();
             }
 
+            double minSize = EffectiveFvgMinSize();
+
             double highTwoBarsBack = Bars.HighPrices.Last(3);
             double lowCurrentClosed = Bars.LowPrices.Last(ClosedBarOffset);
 
-            if (highTwoBarsBack < lowCurrentClosed && (lowCurrentClosed - highTwoBarsBack) >= FvgMinSize)
+            if (highTwoBarsBack < lowCurrentClosed && (lowCurrentClosed - highTwoBarsBack) >= minSize)
             {
                 _bullFvgTop = lowCurrentClosed;
                 _bullFvgBottom = highTwoBarsBack;
@@ -636,7 +942,7 @@ namespace cAlgo.Robots
             double lowTwoBarsBack = Bars.LowPrices.Last(3);
             double highCurrentClosed = Bars.HighPrices.Last(ClosedBarOffset);
 
-            if (lowTwoBarsBack > highCurrentClosed && (lowTwoBarsBack - highCurrentClosed) >= FvgMinSize)
+            if (lowTwoBarsBack > highCurrentClosed && (lowTwoBarsBack - highCurrentClosed) >= minSize)
             {
                 _bearFvgTop = lowTwoBarsBack;
                 _bearFvgBottom = highCurrentClosed;
@@ -660,6 +966,9 @@ namespace cAlgo.Robots
 
         private bool AllFiltersPass()
         {
+            if (_killSwitchHit)
+                return false;
+
             if (_tradesToday >= MaxTradesPerDay)
                 return false;
 
@@ -667,6 +976,9 @@ namespace cAlgo.Robots
                 return false;
 
             if (IsInHardCutoffHour())
+                return false;
+
+            if (IsInNewsBlackout())
                 return false;
 
             if (UseSessionFilter && !IsInSession())
@@ -698,6 +1010,7 @@ namespace cAlgo.Robots
             double high = Bars.HighPrices.Last(ClosedBarOffset);
             double low = Bars.LowPrices.Last(ClosedBarOffset);
             double ema = _ema.Result.Last(ClosedBarOffset);
+            double atrValue = _atr.Result.Last(ClosedBarOffset);
 
             bool structureReady = !double.IsNaN(_lastSwingHigh1) && !double.IsNaN(_lastSwingHigh2) &&
                                   !double.IsNaN(_lastSwingLow1) && !double.IsNaN(_lastSwingLow2);
@@ -716,8 +1029,14 @@ namespace cAlgo.Robots
             if (!bullishStructure && !bearishStructure)
                 return;
 
-            bool pullbackToBuy = bullishStructure && low <= ema * 1.002 && close > ema;
-            bool pullbackToSell = bearishStructure && high >= ema * 0.998 && close < ema;
+            // Pullback tolerance: ATR-relative adapts to volatility; legacy mode
+            // keeps the original 0.2%-of-price band.
+            double pullbackTolerance = UseAtrRelative && !double.IsNaN(atrValue) && atrValue > 0
+                ? atrValue * PullbackAtrTolerance
+                : ema * 0.002;
+
+            bool pullbackToBuy = bullishStructure && low <= ema + pullbackTolerance && close > ema;
+            bool pullbackToSell = bearishStructure && high >= ema - pullbackTolerance && close < ema;
 
             int currentBarIndex = CurrentClosedBarIndex;
 
@@ -818,6 +1137,38 @@ namespace cAlgo.Robots
             }
         }
 
+        // Sizes the position from a fixed % of equity so the dollar risk per
+        // trade stays constant even though the ATR stop distance varies.
+        private double ComputeVolumeInUnits(double slPips)
+        {
+            double volumeUnits;
+
+            if (UsePercentRisk)
+            {
+                double riskAmount = Account.Equity * RiskPercent / 100.0;
+                double riskPerUnit = slPips * Symbol.PipValue;
+
+                if (riskPerUnit <= 0)
+                    return 0;
+
+                volumeUnits = riskAmount / riskPerUnit;
+
+                double capUnits = Symbol.QuantityToVolumeInUnits(MaxLots);
+                volumeUnits = Math.Min(volumeUnits, capUnits);
+            }
+            else
+            {
+                volumeUnits = Symbol.QuantityToVolumeInUnits(Lots);
+            }
+
+            volumeUnits = Symbol.NormalizeVolumeInUnits(volumeUnits, RoundingMode.Down);
+
+            if (volumeUnits < Symbol.VolumeInUnitsMin)
+                return 0;
+
+            return volumeUnits;
+        }
+
         private bool ExecuteEntry(TradeType direction)
         {
             double atrValue = _atr.Result.Last(ClosedBarOffset);
@@ -831,19 +1182,31 @@ namespace cAlgo.Robots
             double slDistance = atrValue * AtrMultiplier;
             double tpDistance = slDistance * RiskReward;
 
+            if (MaxSpreadPctOfSl > 0)
+            {
+                double spreadPct = Symbol.Spread / slDistance * 100.0;
+
+                if (spreadPct > MaxSpreadPctOfSl)
+                {
+                    Print("Entry skipped - spread {0:F1}% of SL exceeds {1}% limit.", spreadPct, MaxSpreadPctOfSl);
+                    return false;
+                }
+            }
+
             double slPips = slDistance / Symbol.PipSize;
             double tpPips = tpDistance / Symbol.PipSize;
 
-            double volume = Symbol.QuantityToVolumeInUnits(Lots);
-            volume = Symbol.NormalizeVolumeInUnits(volume, RoundingMode.Down);
+            double volume = ComputeVolumeInUnits(slPips);
 
             if (volume <= 0)
             {
-                Print("Calculated volume is zero - skipping entry. Check Lots vs symbol minimum.");
+                Print("Calculated volume below symbol minimum - skipping entry. Check risk settings vs SL distance.");
                 return false;
             }
 
-            var result = ExecuteMarketOrder(direction, SymbolName, volume, Label, slPips, tpPips);
+            string comment = RiskCommentPrefix + slPips.ToString("F1", CultureInfo.InvariantCulture);
+
+            var result = ExecuteMarketOrder(direction, SymbolName, volume, Label, slPips, tpPips, comment);
 
             if (!result.IsSuccessful)
             {
@@ -854,8 +1217,22 @@ namespace cAlgo.Robots
             _tradesToday++;
             _tradesFired++;
 
-            Print("{0} entry filled. Volume {1} SL {2:F1} pips TP {3:F1} pips Trades {4}/{5}",
-                  direction, volume, slPips, tpPips, _tradesToday, MaxTradesPerDay);
+            // Never run a position without a stop: if the broker rejected the
+            // SL (e.g. min stop distance), bail out immediately.
+            var position = result.Position;
+
+            if (position == null || !position.StopLoss.HasValue)
+            {
+                Print("CRITICAL: stop loss missing after fill - closing naked position immediately.");
+
+                if (position != null)
+                    ClosePosition(position);
+
+                return false;
+            }
+
+            Print("{0} entry filled. Volume {1} ({2:F2} lots) SL {3:F1} pips TP {4:F1} pips Trades {5}/{6}",
+                  direction, volume, Symbol.VolumeInUnitsToQuantity(volume), slPips, tpPips, _tradesToday, MaxTradesPerDay);
 
             return true;
         }
