@@ -101,19 +101,19 @@ namespace cAlgo.Robots
         [Parameter("Enable Day Filter", Group = "Day Filter", DefaultValue = true)]
         public bool UseDayFilter { get; set; }
 
-        [Parameter("Trade Monday", Group = "Day Filter", DefaultValue = false)]
+        [Parameter("Long Monday", Group = "Day Filter", DefaultValue = true)]
         public bool TradeMon { get; set; }
 
-        [Parameter("Trade Tuesday", Group = "Day Filter", DefaultValue = true)]
+        [Parameter("Short Tuesday", Group = "Day Filter", DefaultValue = true)]
         public bool TradeTue { get; set; }
 
-        [Parameter("Trade Wednesday", Group = "Day Filter", DefaultValue = true)]
+        [Parameter("Short Wednesday", Group = "Day Filter", DefaultValue = true)]
         public bool TradeWed { get; set; }
 
-        [Parameter("Trade Thursday", Group = "Day Filter", DefaultValue = true)]
+        [Parameter("Short Thursday", Group = "Day Filter", DefaultValue = true)]
         public bool TradeThu { get; set; }
 
-        [Parameter("Trade Friday", Group = "Day Filter", DefaultValue = false)]
+        [Parameter("Long Friday", Group = "Day Filter", DefaultValue = true)]
         public bool TradeFri { get; set; }
 
         [Parameter("Block First 5 Days of Month", Group = "Day Filter", DefaultValue = true)]
@@ -223,8 +223,11 @@ namespace cAlgo.Robots
         [Parameter("Max Trades Per Day", Group = "Risk Management", DefaultValue = 2, MinValue = 1, MaxValue = 5)]
         public int MaxTradesPerDay { get; set; }
 
-        [Parameter("Order Label", Group = "Risk Management", DefaultValue = "DualEdge_TueThu")]
+        [Parameter("Short Order Label", Group = "Risk Management", DefaultValue = "DualEdge_TueThu_Short")]
         public string Label { get; set; }
+
+        [Parameter("Long Order Label", Group = "Risk Management", DefaultValue = "DualEdge_MonFri_Long")]
+        public string LongLabel { get; set; }
 
         // --- TRADE MANAGEMENT ---
         [Parameter("Enable Breakeven", Group = "Trade Management", DefaultValue = true)]
@@ -322,6 +325,17 @@ namespace cAlgo.Robots
             get { return Bars.Count - 2; }
         }
 
+        private string GetLabelForDirection(TradeType direction)
+        {
+            return direction == TradeType.Buy ? LongLabel : Label;
+        }
+
+        private bool IsStrategyLabel(string label)
+        {
+            return string.Equals(label, Label, StringComparison.Ordinal) ||
+                   string.Equals(label, LongLabel, StringComparison.Ordinal);
+        }
+
         protected override void OnStart()
         {
             _ema = Indicators.ExponentialMovingAverage(Bars.ClosePrices, TrendLength);
@@ -348,6 +362,9 @@ namespace cAlgo.Robots
             Print("MTF: HTF={0} EMA{1} structAgree={2} | LTF={3} EMA{4} | ReEntryBlock={5} cd={6}bars afterLossOnly={7}",
                   HtfTimeFrame, HtfEmaLength, HtfRequireStructure, LtfTimeFrame, LtfEmaLength,
                   BlockSameDirection, SameDirCooldownBars, OnlyBlockAfterLoss);
+
+            Print("DAY SLEEVES: longs Mon={0} Fri={1} label={2} | shorts Tue={3} Wed={4} Thu={5} label={6}",
+                  TradeMon, TradeFri, LongLabel, TradeTue, TradeWed, TradeThu, Label);
 
             Print("RISK: sizing={0} | spreadGuard {1}% of SL | killSwitch {2}% | BE {3} @ {4}R +{5}pips | trail {6} {7}xATR from {8}R | atrRelative={9}",
                   UsePercentRisk ? RiskPercent + "% equity (cap " + MaxLots + " lots)" : "fixed " + Lots + " lots",
@@ -393,7 +410,7 @@ namespace cAlgo.Robots
 
             foreach (HistoricalTrade trade in History)
             {
-                if (trade.Label != Label || trade.SymbolName != SymbolName)
+                if (!IsStrategyLabel(trade.Label) || trade.SymbolName != SymbolName)
                     continue;
 
                 if (trade.EntryTime.Date == today)
@@ -406,8 +423,11 @@ namespace cAlgo.Robots
             double floating = 0;
             double preExistingFloating = 0;
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
             {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 if (position.EntryTime.Date == today)
                 {
                     entriesToday++;
@@ -439,7 +459,7 @@ namespace cAlgo.Robots
         private void OnPositionClosed(PositionClosedEventArgs args)
         {
             var p = args.Position;
-            if (p.Label != Label || p.SymbolName != SymbolName)
+            if (!IsStrategyLabel(p.Label) || p.SymbolName != SymbolName)
                 return;
 
             _lastClosedDirection = p.TradeType;
@@ -472,9 +492,6 @@ namespace cAlgo.Robots
             // structure state is never stale when the next entry is evaluated.
             UpdateSwings();
             UpdateFvgs();
-
-            if (HasOpenPosition())
-                return;
 
             if (!AllFiltersPass())
                 return;
@@ -510,8 +527,13 @@ namespace cAlgo.Robots
         {
             double total = 0;
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
+            {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 total += position.NetProfit;
+            }
 
             return total;
         }
@@ -549,8 +571,13 @@ namespace cAlgo.Robots
             _killSwitchHit = true;
             Print("KILL SWITCH: total drawdown {0:F2}% >= {1}% - flattening and halting all trading.", drawdownPct, MaxTotalDrawdown);
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
+            {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 ClosePosition(position);
+            }
         }
 
         private bool IsInSession()
@@ -597,8 +624,11 @@ namespace cAlgo.Robots
             if (Server.Time < cutoff)
                 cutoff = cutoff.AddDays(-1);
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
             {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 if (position.EntryTime < cutoff)
                 {
                     ClosePosition(position);
@@ -616,8 +646,11 @@ namespace cAlgo.Robots
             if (IsInSession())
                 return;
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
             {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 ClosePosition(position);
                 Print("Position closed outside session. ID {0}", position.Id);
             }
@@ -628,8 +661,11 @@ namespace cAlgo.Robots
             if (!UseMaxHoldTime && SoftLossCutMoney <= 0)
                 return;
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
             {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 double hoursOpen = (Server.Time - position.EntryTime).TotalHours;
 
                 if (UseMaxHoldTime && hoursOpen >= MaxHoldHours)
@@ -662,8 +698,11 @@ namespace cAlgo.Robots
 
             double atrValue = _atr.Result.Count > AtrLength ? _atr.Result.Last(ClosedBarOffset) : double.NaN;
 
-            foreach (var position in Positions.FindAll(Label, SymbolName))
+            foreach (var position in Positions)
             {
+                if (!IsStrategyLabel(position.Label) || position.SymbolName != SymbolName)
+                    continue;
+
                 double riskDistance = GetInitialRiskDistance(position);
 
                 if (riskDistance <= 0)
@@ -752,9 +791,9 @@ namespace cAlgo.Robots
             return slPips * Symbol.PipSize;
         }
 
-        private bool HasOpenPosition()
+        private bool HasOpenPosition(TradeType direction)
         {
-            return Positions.FindAll(Label, SymbolName).Length > 0;
+            return Positions.FindAll(GetLabelForDirection(direction), SymbolName).Length > 0;
         }
 
         private bool IsSameDirectionBlocked(TradeType direction)
@@ -1064,6 +1103,22 @@ namespace cAlgo.Robots
             return true;
         }
 
+        private bool DirectionAllowedToday(TradeType direction)
+        {
+            if (!UseDayFilter)
+                return true;
+
+            DayOfWeek today = Server.Time.DayOfWeek;
+
+            if (direction == TradeType.Buy)
+                return (today == DayOfWeek.Monday && TradeMon) ||
+                       (today == DayOfWeek.Friday && TradeFri);
+
+            return (today == DayOfWeek.Tuesday && TradeTue) ||
+                   (today == DayOfWeek.Wednesday && TradeWed) ||
+                   (today == DayOfWeek.Thursday && TradeThu);
+        }
+
         private void EvaluateEntries()
         {
             if (UseFibSwingScore)
@@ -1220,7 +1275,7 @@ namespace cAlgo.Robots
             if (!TryGetLastSwing(StructureLen, out swingHigh, out swingLow, out direction, out pivotBar))
                 return false;
 
-            if (FibShortBiasOnly && direction != TradeType.Sell)
+            if (FibShortBiasOnly && direction != TradeType.Sell && !(UseDayFilter && DirectionAllowedToday(TradeType.Buy)))
                 return false;
 
             double range = swingHigh - swingLow;
@@ -1373,6 +1428,22 @@ namespace cAlgo.Robots
 
         private bool DirectionalEntryFiltersPass(TradeType direction)
         {
+            if (!DirectionAllowedToday(direction))
+            {
+                if (DiagnosticMode)
+                    Print("{0} skipped - direction is not enabled for {1}.", direction, Server.Time.DayOfWeek);
+
+                return false;
+            }
+
+            if (HasOpenPosition(direction))
+            {
+                if (DiagnosticMode)
+                    Print("{0} skipped - {1} sleeve already has an open position.", direction, GetLabelForDirection(direction));
+
+                return false;
+            }
+
             if (direction == TradeType.Buy)
             {
                 if (!HtfAllowsLong())
@@ -1623,12 +1694,14 @@ namespace cAlgo.Robots
             }
 
             string comment = RiskCommentPrefix + slPips.ToString("F1", CultureInfo.InvariantCulture) +
-                             ";Setup=" + setupName;
+                             ";Setup=" + setupName +
+                             ";Sleeve=" + (direction == TradeType.Buy ? "MonFriLong" : "TueThuShort");
 
             if (!string.IsNullOrEmpty(setupDetails))
                 comment += ";" + setupDetails;
 
-            var result = ExecuteMarketOrder(direction, SymbolName, volume, Label, slPips, tpPips, comment);
+            string orderLabel = GetLabelForDirection(direction);
+            var result = ExecuteMarketOrder(direction, SymbolName, volume, orderLabel, slPips, tpPips, comment);
 
             if (!result.IsSuccessful)
             {
