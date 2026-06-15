@@ -145,6 +145,9 @@ namespace cAlgo.Robots
         [Parameter("Swing Stop Buffer (ATR mult)", Group = "Fib Score Arm", DefaultValue = 0.1, MinValue = 0.0, MaxValue = 2.0, Step = 0.05)]
         public double FibSwingStopBufferAtr { get; set; }
 
+        [Parameter("Allow Legacy Fallback", Group = "Fib Score Arm", DefaultValue = false)]
+        public bool AllowLegacyFallbackWithFibScore { get; set; }
+
         // --- MULTI-TIMEFRAME ---
         [Parameter("Use HTF Bias Filter", Group = "Multi-Timeframe", DefaultValue = true)]
         public bool UseHtfBias { get; set; }
@@ -353,8 +356,8 @@ namespace cAlgo.Robots
                   UseAtrTrail, TrailAtrMultiplier, TrailStartR, UseAtrRelative);
 
             if (UseFibSwingScore)
-                Print("FIB SCORE ARM enabled: threshold {0:F2}, zone tolerance {1:P1} of range, shortBiasOnly={2}, stopBuffer={3}xATR.",
-                      FibScoreThreshold, FibZoneTolerance, FibShortBiasOnly, FibSwingStopBufferAtr);
+                Print("FIB SCORE ARM enabled: threshold {0:F2}, zone tolerance {1:P1} of range, shortBiasOnly={2}, stopBuffer={3}xATR, legacyFallback={4}.",
+                      FibScoreThreshold, FibZoneTolerance, FibShortBiasOnly, FibSwingStopBufferAtr, AllowLegacyFallbackWithFibScore);
 
             if (UseHardCutoff)
                 Print("HARD CUTOFF enabled: all positions flattened at {0:00}:00 UTC and no entries during that hour.", HardCutoffHour);
@@ -727,12 +730,23 @@ namespace cAlgo.Robots
         {
             string comment = position.Comment;
 
-            if (string.IsNullOrEmpty(comment) || !comment.StartsWith(RiskCommentPrefix, StringComparison.Ordinal))
+            if (string.IsNullOrEmpty(comment))
                 return 0;
+
+            int riskIndex = comment.IndexOf(RiskCommentPrefix, StringComparison.Ordinal);
+
+            if (riskIndex < 0)
+                return 0;
+
+            int valueStart = riskIndex + RiskCommentPrefix.Length;
+            int valueEnd = comment.IndexOf(';', valueStart);
+
+            if (valueEnd < 0)
+                valueEnd = comment.Length;
 
             double slPips;
 
-            if (!double.TryParse(comment.Substring(RiskCommentPrefix.Length), NumberStyles.Float, CultureInfo.InvariantCulture, out slPips))
+            if (!double.TryParse(comment.Substring(valueStart, valueEnd - valueStart), NumberStyles.Float, CultureInfo.InvariantCulture, out slPips))
                 return 0;
 
             return slPips * Symbol.PipSize;
@@ -1052,8 +1066,13 @@ namespace cAlgo.Robots
 
         private void EvaluateEntries()
         {
-            if (UseFibSwingScore && EvaluateFibScoreEntry())
-                return;
+            if (UseFibSwingScore)
+            {
+                bool fibTradePlaced = EvaluateFibScoreEntry();
+
+                if (fibTradePlaced || !AllowLegacyFallbackWithFibScore)
+                    return;
+            }
 
             double close = Bars.ClosePrices.Last(ClosedBarOffset);
             double high = Bars.HighPrices.Last(ClosedBarOffset);
@@ -1236,7 +1255,11 @@ namespace cAlgo.Robots
                 return false;
             }
 
-            if (ExecuteEntry(direction, slPips, tpPips, "FibScore"))
+            string setupDetails = string.Format(CultureInfo.InvariantCulture,
+                                                "Score={0:F2};P={1:F2};T={2:F2};FVG={3}",
+                                                score, priceScore, timeScore, fvg ? 1 : 0);
+
+            if (ExecuteEntry(direction, slPips, tpPips, "FibScore", setupDetails))
             {
                 if (direction == TradeType.Buy && fvg)
                     ClearBullFvg();
@@ -1555,6 +1578,11 @@ namespace cAlgo.Robots
 
         private bool ExecuteEntry(TradeType direction, double slPips, double tpPips, string setupName)
         {
+            return ExecuteEntry(direction, slPips, tpPips, setupName, string.Empty);
+        }
+
+        private bool ExecuteEntry(TradeType direction, double slPips, double tpPips, string setupName, string setupDetails)
+        {
             if (slPips <= 0 || tpPips <= 0)
             {
                 Print("{0} entry skipped - invalid SL/TP distances. SL {1:F1} pips TP {2:F1} pips.",
@@ -1594,7 +1622,11 @@ namespace cAlgo.Robots
                 return false;
             }
 
-            string comment = RiskCommentPrefix + slPips.ToString("F1", CultureInfo.InvariantCulture);
+            string comment = RiskCommentPrefix + slPips.ToString("F1", CultureInfo.InvariantCulture) +
+                             ";Setup=" + setupName;
+
+            if (!string.IsNullOrEmpty(setupDetails))
+                comment += ";" + setupDetails;
 
             var result = ExecuteMarketOrder(direction, SymbolName, volume, Label, slPips, tpPips, comment);
 
