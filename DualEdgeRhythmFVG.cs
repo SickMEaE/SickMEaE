@@ -16,7 +16,7 @@
 //   3) HTF/LTF filters wait for EMA warm-up instead of using too little data.
 //   4) _tradesFired increments only after successful order execution.
 //   5) Expired/violated FVGs are explicitly invalidated.
-//   6) Optional warning if bot is attached to a non-XAG symbol.
+//   6) Optional warning if bot is attached to a non-XAU symbol.
 //   7) Hard cutoff hour (default 05:00 UTC): flattens ALL bot positions and
 //      blocks new entries during that hour, regardless of other settings.
 //
@@ -401,22 +401,32 @@ namespace cAlgo.Robots
             }
 
             double floating = 0;
+            double preExistingFloating = 0;
 
             foreach (var position in Positions.FindAll(Label, SymbolName))
             {
                 if (position.EntryTime.Date == today)
+                {
                     entriesToday++;
+                }
+                else
+                {
+                    // On restart, positions carried from previous days should
+                    // not have their already-accrued floating PnL counted as
+                    // today's bot PnL.
+                    preExistingFloating += position.NetProfit;
+                }
 
                 floating += position.NetProfit;
             }
 
             _tradesToday = entriesToday;
             _realizedToday = realizedToday;
-            _floatingAtDayStart = 0;
+            _floatingAtDayStart = preExistingFloating;
 
             // Approximate the equity this bot's account had at the start of the
             // day by backing out today's bot PnL from current equity.
-            _dailyStartEquity = Account.Equity - realizedToday - floating;
+            _dailyStartEquity = Account.Equity - realizedToday - (floating - preExistingFloating);
 
             if (entriesToday > 0)
                 Print("RESTORED daily state from history: {0} trade(s) today, realized {1:F2}, baseline equity {2:F2}.",
@@ -1042,11 +1052,8 @@ namespace cAlgo.Robots
 
         private void EvaluateEntries()
         {
-            if (UseFibSwingScore)
-            {
-                EvaluateFibScoreEntry();
+            if (UseFibSwingScore && EvaluateFibScoreEntry())
                 return;
-            }
 
             double close = Bars.ClosePrices.Last(ClosedBarOffset);
             double high = Bars.HighPrices.Last(ClosedBarOffset);
@@ -1179,7 +1186,7 @@ namespace cAlgo.Robots
             }
         }
 
-        private void EvaluateFibScoreEntry()
+        private bool EvaluateFibScoreEntry()
         {
             double close = Bars.ClosePrices.Last(ClosedBarOffset);
             double high = Bars.HighPrices.Last(ClosedBarOffset);
@@ -1192,15 +1199,15 @@ namespace cAlgo.Robots
             int pivotBar;
 
             if (!TryGetLastSwing(StructureLen, out swingHigh, out swingLow, out direction, out pivotBar))
-                return;
+                return false;
 
             if (FibShortBiasOnly && direction != TradeType.Sell)
-                return;
+                return false;
 
             double range = swingHigh - swingLow;
 
             if (range <= Symbol.TickSize)
-                return;
+                return false;
 
             bool fvg = HasDirectionalFvgConfluence(direction, currentBarIndex, high, low, close);
             double priceScore = CalculateFibPriceScore(close, swingHigh, swingLow, direction);
@@ -1210,12 +1217,12 @@ namespace cAlgo.Robots
                            FibFvgScoreWeight * (fvg ? 1.0 : 0.0);
 
             if (score < FibScoreThreshold)
-                return;
+                return false;
 
             _signalsSeen++;
 
             if (!DirectionalEntryFiltersPass(direction))
-                return;
+                return false;
 
             double slPips;
             double tpPips;
@@ -1226,7 +1233,7 @@ namespace cAlgo.Robots
                     Print("{0} FibScore skipped - invalid swing stop/extension target. score={1:F2} hi={2} lo={3}",
                           direction, score, swingHigh, swingLow);
 
-                return;
+                return false;
             }
 
             if (ExecuteEntry(direction, slPips, tpPips, "FibScore"))
@@ -1238,7 +1245,10 @@ namespace cAlgo.Robots
 
                 Print("{0} FibScore armed: score={1:F2} price={2:F2} time={3:F2} fvg={4} pivotAge={5} SL={6:F1} TP={7:F1}",
                       direction, score, priceScore, timeScore, fvg, currentBarIndex - pivotBar, slPips, tpPips);
+                return true;
             }
+
+            return false;
         }
 
         private bool TryGetLastSwing(int lookback, out double swingHigh, out double swingLow, out TradeType direction, out int pivotBar)
@@ -1318,7 +1328,7 @@ namespace cAlgo.Robots
             {
                 int age = _bullFvgBar >= 0 ? currentBarIndex - _bullFvgBar : -1;
                 bool valid = _bullFvgBar >= 0 &&
-                             age >= 0 &&
+                             age > 0 &&
                              age <= FvgMaxAge &&
                              low > _bullFvgBottom;
 
@@ -1329,7 +1339,7 @@ namespace cAlgo.Robots
 
             int bearAge = _bearFvgBar >= 0 ? currentBarIndex - _bearFvgBar : -1;
             bool bearValid = _bearFvgBar >= 0 &&
-                             bearAge >= 0 &&
+                             bearAge > 0 &&
                              bearAge <= FvgMaxAge &&
                              high < _bearFvgTop;
 
@@ -1481,6 +1491,17 @@ namespace cAlgo.Robots
             return value;
         }
 
+        private double MinDistanceToPips(double minDistance, double referencePrice)
+        {
+            if (minDistance <= 0 || referencePrice <= 0)
+                return 0;
+
+            if (Symbol.MinDistanceType == SymbolMinDistanceType.Pips)
+                return minDistance;
+
+            return referencePrice * minDistance / 100.0 / Symbol.PipSize;
+        }
+
         // Sizes the position from a fixed % of equity so the dollar risk per
         // trade stays constant even though the ATR stop distance varies.
         private double ComputeVolumeInUnits(double slPips)
@@ -1542,6 +1563,17 @@ namespace cAlgo.Robots
             }
 
             double slDistance = slPips * Symbol.PipSize;
+            double entryPrice = direction == TradeType.Buy ? Symbol.Ask : Symbol.Bid;
+            double minSlPips = MinDistanceToPips(Symbol.MinStopLossDistance, entryPrice);
+            double minTpPips = MinDistanceToPips(Symbol.MinTakeProfitDistance, entryPrice);
+
+            if (slPips + Symbol.TickSize / Symbol.PipSize < minSlPips ||
+                tpPips + Symbol.TickSize / Symbol.PipSize < minTpPips)
+            {
+                Print("{0} entry skipped - SL/TP too close for symbol minimums. SL {1:F1}/{2:F1} pips TP {3:F1}/{4:F1} pips.",
+                      setupName, slPips, minSlPips, tpPips, minTpPips);
+                return false;
+            }
 
             if (MaxSpreadPctOfSl > 0)
             {
