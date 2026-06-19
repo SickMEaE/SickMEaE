@@ -22,6 +22,7 @@
 //   8) Risk/session exits and hard cutoff are checked on ticks as well as bars.
 //   9) Position close results are checked before journalling them as closed.
 //  10) Optional hourly information journal for operational diagnostics.
+//  11) Optional fixed-fractional sizing based on account equity and SL distance.
 // ===========================================================================
 
 using System;
@@ -129,6 +130,18 @@ namespace cAlgo.Robots
         // --- RISK MANAGEMENT ---
         [Parameter("Lot Size", Group = "Risk Management", DefaultValue = 0.06, MinValue = 0.01, Step = 0.01)]
         public double Lots { get; set; }
+
+        [Parameter("Use Fixed Fractional Sizing", Group = "Risk Management", DefaultValue = false)]
+        public bool UseFixedFractionalSizing { get; set; }
+
+        [Parameter("Risk Per Trade %", Group = "Risk Management", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 10.0, Step = 0.1)]
+        public double RiskPerTradePercent { get; set; }
+
+        [Parameter("Min FF Lot Size", Group = "Risk Management", DefaultValue = 0.01, MinValue = 0.01, Step = 0.01)]
+        public double MinFixedFractionalLots { get; set; }
+
+        [Parameter("Max FF Lot Size", Group = "Risk Management", DefaultValue = 0.50, MinValue = 0.01, Step = 0.01)]
+        public double MaxFixedFractionalLots { get; set; }
 
         [Parameter("Risk:Reward Ratio", Group = "Risk Management", DefaultValue = 2.0, MinValue = 1.0, MaxValue = 5.0, Step = 0.5)]
         public double RiskReward { get; set; }
@@ -242,6 +255,10 @@ namespace cAlgo.Robots
             Print("MTF: HTF={0} EMA{1} structAgree={2} | LTF={3} EMA{4} | ReEntryBlock={5} cd={6}bars afterLossOnly={7}",
                   HtfTimeFrame, HtfEmaLength, HtfRequireStructure, LtfTimeFrame, LtfEmaLength,
                   BlockSameDirection, SameDirCooldownBars, OnlyBlockAfterLoss);
+
+            Print("Sizing: mode={0} fixedLots={1} risk={2:F2}% minFF={3} maxFF={4}",
+                  UseFixedFractionalSizing ? "fixed-fractional" : "fixed-lot",
+                  Lots, RiskPerTradePercent, MinFixedFractionalLots, MaxFixedFractionalLots);
 
             if (UseHardCutoff)
                 Print("HARD CUTOFF enabled: all bot-label positions flattened at {0:00}:00 UTC and no entries during that hour.", HardCutoffHour);
@@ -887,12 +904,11 @@ namespace cAlgo.Robots
             double slPips = slDistance / Symbol.PipSize;
             double tpPips = tpDistance / Symbol.PipSize;
 
-            double volume = Symbol.QuantityToVolumeInUnits(Lots);
-            volume = Symbol.NormalizeVolumeInUnits(volume, RoundingMode.Down);
+            double volume = CalculateEntryVolume(slPips);
 
             if (volume <= 0)
             {
-                Print("Calculated volume is zero - skipping entry. Check Lots vs symbol minimum.");
+                Print("Calculated volume is zero - skipping entry. Check sizing parameters and symbol minimum.");
                 return false;
             }
 
@@ -911,6 +927,47 @@ namespace cAlgo.Robots
                   direction, volume, slPips, tpPips, _tradesToday, MaxTradesPerDay);
 
             return true;
+        }
+
+        private double CalculateEntryVolume(double stopLossPips)
+        {
+            if (!UseFixedFractionalSizing)
+                return NormalizeLotsToVolume(Lots);
+
+            if (stopLossPips <= 0 || Symbol.PipValue <= 0)
+            {
+                Print("Fixed-fractional sizing failed: invalid SL pips {0:F2} or PipValue {1}.",
+                      stopLossPips, Symbol.PipValue);
+                return 0;
+            }
+
+            double riskMoney = Account.Equity * (RiskPerTradePercent / 100.0);
+            double rawVolume = riskMoney / (stopLossPips * Symbol.PipValue);
+            double minVolume = NormalizeLotsToVolume(MinFixedFractionalLots);
+            double maxVolume = NormalizeLotsToVolume(MaxFixedFractionalLots);
+
+            if (maxVolume > 0 && rawVolume > maxVolume)
+                rawVolume = maxVolume;
+
+            double volume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundingMode.Down);
+
+            if (minVolume > 0 && volume < minVolume)
+            {
+                Print("Fixed-fractional volume {0} is below minimum configured volume {1}; skipping entry.",
+                      volume, minVolume);
+                return 0;
+            }
+
+            Print("Fixed-fractional sizing: equity={0:F2} risk={1:F2}% riskMoney={2:F2} sl={3:F1}p rawVol={4:F0} finalVol={5:F0}",
+                  Account.Equity, RiskPerTradePercent, riskMoney, stopLossPips, rawVolume, volume);
+
+            return volume;
+        }
+
+        private double NormalizeLotsToVolume(double lots)
+        {
+            double volume = Symbol.QuantityToVolumeInUnits(lots);
+            return Symbol.NormalizeVolumeInUnits(volume, RoundingMode.Down);
         }
 
         private void WriteHourlyJournalIfDue()
@@ -939,11 +996,14 @@ namespace cAlgo.Robots
             string sessionState = IsInHardCutoffHour() ? "hard-cutoff" : (IsInSession() ? "in-session" : "out-of-session");
             string dayState = UseDayFilter ? (IsTradeDayAllowed() ? "allowed" : "blocked") : "filter-off";
             string monthState = IsEarlyMonthBlocked() ? "blocked-early-month" : "allowed";
+            string sizingState = UseFixedFractionalSizing
+                ? string.Format("fixed-fractional risk={0:F2}% minLot={1} maxLot={2}", RiskPerTradePercent, MinFixedFractionalLots, MaxFixedFractionalLots)
+                : string.Format("fixed-lot lots={0}", Lots);
             string chartState = GetChartJournalSnapshot();
             string fvgState = GetFvgJournalSnapshot();
             string mtfState = JournalMtfSnapshot ? " | " + GetMtfJournalSnapshot() : string.Empty;
 
-            Print("{0} JOURNAL {1:yyyy-MM-dd HH}:00 UTC | {2} | day={3} month={4} | equity={5:F2} dailyLoss={6:F2}% hit={7} | trades={8}/{9} fired={10} | positions label/all={11} symbol={12} | {13} | {14} | signals={15} htfBlk={16} ltfBlk={17} reentryBlk={18}{19}",
+            Print("{0} JOURNAL {1:yyyy-MM-dd HH}:00 UTC | {2} | day={3} month={4} | equity={5:F2} dailyLoss={6:F2}% hit={7} | sizing={8} | trades={9}/{10} fired={11} | positions label/all={12} symbol={13} | {14} | {15} | signals={16} htfBlk={17} ltfBlk={18} reentryBlk={19}{20}",
                   reason,
                   currentHour,
                   sessionState,
@@ -952,6 +1012,7 @@ namespace cAlgo.Robots
                   Account.Equity,
                   GetDailyLossPercent(),
                   _dailyLossHit,
+                  sizingState,
                   _tradesToday,
                   MaxTradesPerDay,
                   _tradesFired,
